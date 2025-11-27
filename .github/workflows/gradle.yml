@@ -51,37 +51,47 @@ jobs:
       - name: Generate and submit dependency graph
         uses: gradle/actions/dependency-submission@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
 
-  trivy-fs-scan:
-    # Optional: run only after build succeeds
+   trivy-fs-scan:
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write   # needed to upload SARIF to Security tab
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run Trivy vulnerability scanner in filesystem mode
+      - name: Run Trivy vulnerability scanner in filesystem mode (JSON)
         uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: 'fs'
-          scan-ref: '.'                 # scan the whole repo
-          format: 'sarif'
-          output: 'trivy-fs-results.sarif'
-          ignore-unfixed: true          # optional: reduce noise
-          severity: 'CRITICAL,HIGH'     # adjust as you like
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-report.json'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
 
-      - name: Upload Trivy fs results as artifact
+      - name: Run Trivy vulnerability scanner in filesystem mode (HTML)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'template'
+          template: '@/contrib/html.tpl'
+          output: 'trivy-report.html'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy JSON Report Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trivy-fs-results
-          path: trivy-fs-results.sarif
+          name: trivy-json-report
+          path: trivy-report.json
 
-      - name: Upload Trivy fs results to GitHub Security tab
+      - name: Upload Trivy HTML Report Artifact
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: actions/upload-artifact@v4
         with:
-          sarif_file: 'trivy-fs-results.sarif'
+          name: trivy-html-report
+          path: trivy-report.html
