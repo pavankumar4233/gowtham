@@ -37,7 +37,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # 4. Build Gradle project (update task if needed, e.g. bootJar)
+      # 4. Build Gradle project (update task if needed, e.g. bootJar) 
       - name: Build with Gradle
         run: |
           chmod +x ./gradlew
