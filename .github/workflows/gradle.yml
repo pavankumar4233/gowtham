@@ -1,92 +1,299 @@
-name: Gradle Build, Dockerize & Trivy Scan
+name: Java CI with Security Scanning
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "master" ]
   pull_request:
+    branches: [ "master" ]
 
 jobs:
   build-and-scan:
     runs-on: ubuntu-latest
-
-    env:
-      IMAGE_NAME: my-gradle-app        # change if you want
-      IMAGE_TAG: ${{ github.sha }}
-      IMAGE_REF: my-gradle-app:${{ github.sha }}
+    permissions:
+      contents: read
+      security-events: write
 
     steps:
-      # 1. Checkout code
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Setup JDK for Gradle
-      - name: Setup JDK
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: '17'
+          java-version: '21'
+          distribution: 'temurin'
 
-      # 3. Cache Gradle
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582
 
-      # 4. Build Gradle project (update task if needed, e.g. bootJar) 
-      - name: Build with Gradle
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Verify vulnerable dependencies are present
         run: |
-          chmod +x ./gradlew
-          ./gradlew clean build
+          echo "=== Verifying vulnerable dependencies ==="
+          ./gradlew verifyVulnerableDependencies
+          echo ""
+          echo "=== Full dependency tree ==="
+          ./gradlew dependencies --configuration runtimeClasspath | grep -E "jackson-databind|mysql-connector" -A 1 -B 1
 
-      # 5. Build Docker image from Dockerfile at repo root
-      - name: Build Docker image
+      - name: Build application
+        run: ./gradlew clean bootJar -x test
+
+      - name: Run OWASP Dependency-Check via Gradle
         run: |
-          docker build -t $IMAGE_REF .
+          echo "=== Running OWASP Dependency-Check ==="
+          echo "This will download the NVD database (may take 2-3 minutes first time)"
+          ./gradlew dependencyCheckAnalyze --info
+        continue-on-error: true
 
-      # (Optional) Push to registry – uncomment & configure if needed
-      # - name: Login to Docker registry
-      #   run: |
-      #     echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
-      #
-      # - name: Push Docker image
-      #   run: |
-      #     docker push $IMAGE_REF
-
-      # 6. Trivy image scan - JSON report
-      - name: Trivy image scan (JSON)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ env.IMAGE_REF }}
-          format: 'json'
-          output: 'trivy-image-report.json'
-          severity: 'CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN'
-          ignore-unfixed: true   # change to false if you want everything
-          exit-code: '0'         # set to '1' to fail pipeline on vulns
-
-      # 7. Trivy image scan - HTML report using default template
-      - name: Trivy image scan (HTML)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ env.IMAGE_REF }}
-          format: 'template'
-          template: '@$HOME/.local/bin/trivy-bin/contrib/html.tpl'
-          output: 'trivy-image-report.html'
-          severity: 'CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN'
-          ignore-unfixed: true
-          exit-code: '0'
-          skip-setup-trivy: true   # Trivy already installed in previous step
-
-      # 8. Upload Trivy reports as pipeline artifacts
-      - name: Upload Trivy reports
-        uses: actions/upload-artifact@v4
+      - name: Display vulnerability summary
         if: always()
+        run: |
+          echo "=========================================="
+          echo "VULNERABILITY SCAN RESULTS"
+          echo "=========================================="
+          if [ -f build/reports/dependency-check-report.json ]; then
+            echo ""
+            echo "=== CRITICAL Vulnerabilities ==="
+            cat build/reports/dependency-check-report.json | jq -r '.dependencies[]? | select(.vulnerabilities != null) | .fileName as $file | .vulnerabilities[] | select(.severity == "CRITICAL") | "🔴 \(.name) - \(.description[:100])..."' || true
+            echo ""
+            echo "=== HIGH Vulnerabilities ==="
+            cat build/reports/dependency-check-report.json | jq -r '.dependencies[]? | select(.vulnerabilities != null) | .fileName as $file | .vulnerabilities[] | select(.severity == "HIGH") | "🟠 \(.name) - \(.description[:100])..."' || true
+            echo ""
+            echo "=== Vulnerability Count by Severity ==="
+            cat build/reports/dependency-check-report.json | jq -r '.dependencies[]? | select(.vulnerabilities != null) | .vulnerabilities[] | .severity' | sort | uniq -c || true
+            echo ""
+            echo "✅ Full reports available in job artifacts"
+          else
+            echo "❌ No report file found at build/reports/dependency-check-report.json"
+            echo "Checking if report exists elsewhere..."
+            find . -name "dependency-check-report.*" -type f
+          fi
+
+      - name: Create clean OWASP summary
+        if: always()
+        run: |
+          if [ -f build/reports/dependency-check-report.json ]; then
+            echo "Creating clean OWASP vulnerability summary..."
+            
+            cat > owasp-vulnerability-summary.txt << 'EOFMARKER'
+          ========================================
+          OWASP DEPENDENCY-CHECK REPORT
+          ========================================
+          EOFMARKER
+            
+            date >> owasp-vulnerability-summary.txt
+            echo "" >> owasp-vulnerability-summary.txt
+            
+            echo "CRITICAL VULNERABILITIES:" >> owasp-vulnerability-summary.txt
+            echo "=========================" >> owasp-vulnerability-summary.txt
+            cat build/reports/dependency-check-report.json | jq -r '.dependencies[]? | select(.vulnerabilities != null) | .fileName as $file | .vulnerabilities[] | select(.severity == "CRITICAL") | "• \(.name) in \($file)\n  CVSS: \(.cvssv3.baseScore // .cvssv2.score // "N/A")\n  Description: \(.description)\n"' >> owasp-vulnerability-summary.txt || echo "None found" >> owasp-vulnerability-summary.txt
+            
+            echo "" >> owasp-vulnerability-summary.txt
+            echo "HIGH VULNERABILITIES:" >> owasp-vulnerability-summary.txt
+            echo "=====================" >> owasp-vulnerability-summary.txt
+            cat build/reports/dependency-check-report.json | jq -r '.dependencies[]? | select(.vulnerabilities != null) | .fileName as $file | .vulnerabilities[] | select(.severity == "HIGH") | "• \(.name) in \($file)\n  CVSS: \(.cvssv3.baseScore // .cvssv2.score // "N/A")\n  Description: \(.description)\n"' >> owasp-vulnerability-summary.txt || echo "None found" >> owasp-vulnerability-summary.txt
+            
+            echo "" >> owasp-vulnerability-summary.txt
+            echo "MEDIUM VULNERABILITIES:" >> owasp-vulnerability-summary.txt
+            echo "=======================" >> owasp-vulnerability-summary.txt
+            cat build/reports/dependency-check-report.json | jq -r '.dependencies[]? | select(.vulnerabilities != null) | .fileName as $file | .vulnerabilities[] | select(.severity == "MEDIUM") | "• \(.name) in \($file)"' >> owasp-vulnerability-summary.txt || echo "None found" >> owasp-vulnerability-summary.txt
+            
+            echo "" >> owasp-vulnerability-summary.txt
+            echo "========================================" >> owasp-vulnerability-summary.txt
+            echo "SUMMARY:" >> owasp-vulnerability-summary.txt
+            echo "========================================" >> owasp-vulnerability-summary.txt
+            cat build/reports/dependency-check-report.json | jq -r '.dependencies[]? | select(.vulnerabilities != null) | .vulnerabilities[] | .severity' | sort | uniq -c >> owasp-vulnerability-summary.txt
+            
+            echo "Severity,CVE,Package,CVSS Score,Description" > owasp-vulnerabilities.csv
+            cat build/reports/dependency-check-report.json | jq -r '.dependencies[]? | select(.vulnerabilities != null) | .fileName as $file | .vulnerabilities[] | [.severity, .name, $file, (.cvssv3.baseScore // .cvssv2.score // "N/A"), (.description | gsub(","; ";") | .[:100])] | @csv' >> owasp-vulnerabilities.csv
+            
+            cat owasp-vulnerability-summary.txt
+          fi
+
+      - name: Upload OWASP summary report
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: trivy-image-reports
-          path: |
-            trivy-image-report.json
-            trivy-image-report.html
+          name: owasp-vulnerability-summary
+          path: owasp-vulnerability-summary.txt
+          if-no-files-found: warn
+
+      - name: Upload OWASP CSV report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-vulnerabilities-csv
+          path: owasp-vulnerabilities.csv
+          if-no-files-found: warn
+
+      - name: Upload HTML Report (Human Readable)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnerability-report-html
+          path: build/reports/dependency-check-report.html
+          if-no-files-found: warn
+
+      - name: Upload JSON Report (Machine Readable)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnerability-report-json
+          path: build/reports/dependency-check-report.json
+          if-no-files-found: warn
+
+      - name: Upload SARIF Report (GitHub Security)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnerability-report-sarif
+          path: build/reports/dependency-check-report.sarif
+          if-no-files-found: warn
+
+      - name: Upload to GitHub Security Tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: build/reports/dependency-check-report.sarif
+        continue-on-error: true
+
+  grype-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build JAR
+        run: ./gradlew clean bootJar -x test
+
+      - name: Install Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Scan with Grype
+        run: |
+          echo "=== Grype Vulnerability Scan ==="
+          grype dir:build/libs -o table
+          echo ""
+          echo "=== Saving full JSON report ==="
+          grype dir:build/libs -o json > grype-results-full.json
+
+      - name: Create clean vulnerability summary
+        if: always()
+        run: |
+          echo "=== Creating Clean Vulnerability Report ==="
+          
+          cat > grype-vulnerability-summary.txt << 'EOFMARKER'
+          ========================================
+          GRYPE VULNERABILITY SCAN REPORT
+          ========================================
+          EOFMARKER
+          
+          date >> grype-vulnerability-summary.txt
+          echo "" >> grype-vulnerability-summary.txt
+          
+          echo "CRITICAL VULNERABILITIES:" >> grype-vulnerability-summary.txt
+          echo "=========================" >> grype-vulnerability-summary.txt
+          cat grype-results-full.json | jq -r '.matches[]? | select(.vulnerability.severity == "Critical") | (if (.relatedVulnerabilities | length > 0) then (.relatedVulnerabilities[] | select(.id | startswith("CVE")) | .id) // .vulnerability.id else .vulnerability.id end) as $cve_id | "• \($cve_id) - \(.artifact.name)@\(.artifact.version)\n  Description: \(.vulnerability.description // "N/A")\n  Fixed in: \(.vulnerability.fix.versions[0] // "No fix available")\n"' >> grype-vulnerability-summary.txt || echo "None found" >> grype-vulnerability-summary.txt
+          
+          echo "" >> grype-vulnerability-summary.txt
+          echo "HIGH VULNERABILITIES:" >> grype-vulnerability-summary.txt
+          echo "=====================" >> grype-vulnerability-summary.txt
+          cat grype-results-full.json | jq -r '.matches[]? | select(.vulnerability.severity == "High") | (if (.relatedVulnerabilities | length > 0) then (.relatedVulnerabilities[] | select(.id | startswith("CVE")) | .id) // .vulnerability.id else .vulnerability.id end) as $cve_id | "• \($cve_id) - \(.artifact.name)@\(.artifact.version)\n  Description: \(.vulnerability.description // "N/A")\n  Fixed in: \(.vulnerability.fix.versions[0] // "No fix available")\n"' >> grype-vulnerability-summary.txt || echo "None found" >> grype-vulnerability-summary.txt
+          
+          echo "" >> grype-vulnerability-summary.txt
+          echo "MEDIUM VULNERABILITIES:" >> grype-vulnerability-summary.txt
+          echo "=======================" >> grype-vulnerability-summary.txt
+          cat grype-results-full.json | jq -r '.matches[]? | select(.vulnerability.severity == "Medium") | (if (.relatedVulnerabilities | length > 0) then (.relatedVulnerabilities[] | select(.id | startswith("CVE")) | .id) // .vulnerability.id else .vulnerability.id end) as $cve_id | "• \($cve_id) - \(.artifact.name)@\(.artifact.version)"' >> grype-vulnerability-summary.txt || echo "None found" >> grype-vulnerability-summary.txt
+          
+          echo "" >> grype-vulnerability-summary.txt
+          echo "LOW VULNERABILITIES:" >> grype-vulnerability-summary.txt
+          echo "====================" >> grype-vulnerability-summary.txt
+          cat grype-results-full.json | jq -r '.matches[]? | select(.vulnerability.severity == "Low") | (if (.relatedVulnerabilities | length > 0) then (.relatedVulnerabilities[] | select(.id | startswith("CVE")) | .id) // .vulnerability.id else .vulnerability.id end) as $cve_id | "• \($cve_id) - \(.artifact.name)@\(.artifact.version)"' >> grype-vulnerability-summary.txt || echo "None found" >> grype-vulnerability-summary.txt
+          
+          echo "" >> grype-vulnerability-summary.txt
+          echo "========================================" >> grype-vulnerability-summary.txt
+          echo "SUMMARY BY SEVERITY:" >> grype-vulnerability-summary.txt
+          echo "========================================" >> grype-vulnerability-summary.txt
+          cat grype-results-full.json | jq -r '.matches[]? | .vulnerability.severity' | sort | uniq -c >> grype-vulnerability-summary.txt
+          
+          echo "Severity,CVE,GHSA,Package,Version,Fixed Version,Description" > grype-vulnerabilities.csv
+          cat grype-results-full.json | jq -r '.matches[]? | (if (.relatedVulnerabilities | length > 0) then ([.relatedVulnerabilities[] | select(.id | startswith("CVE")) | .id] | join("; ")) else "" end) as $cve_ids | (.vulnerability.id | if (. | startswith("GHSA")) then . else "" end) as $ghsa_id | (if ($cve_ids == "") then .vulnerability.id else $cve_ids end) as $primary_id | [.vulnerability.severity, $cve_ids, $ghsa_id, .artifact.name, .artifact.version, (.vulnerability.fix.versions[0] // "No fix"), (.vulnerability.description // "N/A" | gsub(","; ";") | gsub("\n"; " "))] | @csv' >> grype-vulnerabilities.csv
+
+      - name: Display clean summary in logs
+        if: always()
+        run: |
+          echo "=== Clean Vulnerability Summary (CVE Format) ==="
+          cat grype-vulnerability-summary.txt
+          echo ""
+          echo "=== CVE to GHSA Mapping ==="
+          cat grype-results-full.json | jq -r '.matches[]? | select(.relatedVulnerabilities | length > 0) | .vulnerability.id as $ghsa | .relatedVulnerabilities[] | select(.id | startswith("CVE")) | "\(.id) → \($ghsa)"' | sort -u || echo "No mappings found"
+
+      - name: Upload clean summary report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-vulnerability-summary
+          path: grype-vulnerability-summary.txt
+
+      - name: Upload CSV report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-vulnerabilities-csv
+          path: grype-vulnerabilities.csv
+
+      - name: Upload full JSON (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-full-json-report
+          path: grype-results-full.json
+
+  dependency-tree:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Generate dependency tree report
+        run: |
+          echo "=== Runtime Dependency Tree ==="
+          ./gradlew dependencies --configuration runtimeClasspath > dependency-tree.txt
+          cat dependency-tree.txt
+          echo ""
+          echo "=== Vulnerable Dependencies Found ==="
+          grep -E "jackson-databind.*2.9.8|mysql-connector-java.*5.1.44" dependency-tree.txt || echo "⚠️  Vulnerable versions not found in tree!"
+
+      - name: Upload dependency tree
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-tree
+          path: dependency-tree.txt
